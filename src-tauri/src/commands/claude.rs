@@ -122,12 +122,124 @@ fn load_all_sessions_from_disk() -> Vec<SessionMetadata> {
 
 // --- Detection & Installation ---
 
-/// Helper: run a command through the user's login shell to get proper PATH
+/// gtedit: 2026.03.26
+/// Return a platform-appropriate preferred shell/program the frontend can use
+/// when asking the backend to run user-visible shell commands. This does NOT
+/// execute anything — it only reports which shell the frontend should invoke
+/// or show to the user (e.g. "pwsh" on Windows, login shell on macOS/Linux).
+fn resolve_shell() -> String {
+    if cfg!(windows) {
+        if is_executable_in_path("pwsh") {
+            "pwsh".to_string()
+        } else if is_executable_in_path("powershell") {
+            "powershell".to_string()
+        } else {
+            "cmd".to_string()
+        }
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    }
+}
+
+/// gtedit: 2026.03.26
+/// Helper: run a command through the user's login shell or relevant windows exe to get proper PATH
 fn login_shell_cmd(command: &str) -> std::process::Command {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = resolve_shell();
     let mut cmd = std::process::Command::new(&shell);
-    cmd.arg("-l").arg("-c").arg(command);
+
+    if cfg!(windows) {
+        if shell == "cmd" {
+            cmd.arg("/C").arg(command);
+        } else {
+            // pwsh or powershell
+            cmd.arg("-Command").arg(command);
+        }
+    } else {
+        cmd.arg("-l").arg("-c").arg(command);
+    }
+
     cmd
+}
+
+/// gtedit: 2026.03.26
+/// Detect the current OS at runtime. Returns the value of `std::env::consts::OS` which is
+/// one of: "windows", "macos", "linux", etc. This can be used by the frontend to
+/// choose platform-specific install flows (e.g. avoid Homebrew on Windows).
+#[tauri::command]
+pub async fn detect_platform() -> Result<String, String> {
+    Ok(std::env::consts::OS.to_string())
+}
+
+// Small helper to check whether an executable exists on PATH. We check a few
+// common extensions on Windows so callers can probe for things like `winget`.
+fn is_executable_in_path(name: &str) -> bool {
+    use std::path::Path;
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::env::split_paths(&path_var);
+    let exts: Vec<&str> = if cfg!(windows) {
+        vec!["", ".exe", ".cmd", ".bat", ".ps1"]
+    } else {
+        vec![""]
+    };
+
+    for p in paths {
+        for ext in &exts {
+            let candidate = p.join(format!("{}{}", name, ext));
+            if candidate.exists() && candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// gtedit: 2026.03.26
+/// tauri command that passes preferred shell to frontend
+#[tauri::command]
+pub async fn get_preferred_shell() -> Result<String, String> {
+    Ok(resolve_shell())
+}
+
+/// gtedit: 2026.03.26
+/// Suggest available installer mechanisms for the current platform. The
+/// frontend can call this and present platform-appropriate install choices
+/// (e.g. use winget/choco on Windows, brew/npm on macOS/Linux). This only
+/// detects what's available — it does not perform any installation.
+#[tauri::command]
+pub async fn detect_installers() -> Result<Vec<String>, String> {
+    let os = std::env::consts::OS;
+    let mut available: Vec<String> = Vec::new();
+
+    match os {
+        "windows" => {
+            if is_executable_in_path("winget") { available.push("winget".to_string()); }
+            if is_executable_in_path("choco") { available.push("choco".to_string()); }
+            if is_executable_in_path("scoop") { available.push("scoop".to_string()); }
+            if is_executable_in_path("pwsh") || is_executable_in_path("powershell") {
+                available.push("powershell".to_string());
+            }
+            // Always offer manual as a fallback option
+            available.push("manual".to_string());
+        }
+        "macos" => {
+            if is_executable_in_path("brew") { available.push("brew".to_string()); }
+            if is_executable_in_path("npm") { available.push("npm".to_string()); }
+            if is_executable_in_path("curl") { available.push("curl".to_string()); }
+            available.push("manual".to_string());
+        }
+        _ => {
+            // Linux/other
+            if is_executable_in_path("apt") { available.push("apt".to_string()); }
+            if is_executable_in_path("dnf") { available.push("dnf".to_string()); }
+            if is_executable_in_path("yum") { available.push("yum".to_string()); }
+            if is_executable_in_path("snap") { available.push("snap".to_string()); }
+            if is_executable_in_path("npm") { available.push("npm".to_string()); }
+            if is_executable_in_path("curl") { available.push("curl".to_string()); }
+            available.push("manual".to_string());
+        }
+    }
+
+    Ok(available)
 }
 
 #[tauri::command]
@@ -1487,13 +1599,29 @@ pub async fn check_oauth_status() -> Result<bool, String> {
         }
     }
 
+    /// gtedit: 2026.03.26
+    /// now checks for preferred shell type based on OS
+    /// adjusts shell commands based on preferred shell
     // Slow path: actually run claude through a login shell to test auth
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = resolve_shell();
+    let mut command = tokio::process::Command::new(&shell);
 
-    let output = tokio::process::Command::new(&shell)
-        .arg("-l")
-        .arg("-c")
-        .arg("claude -p 'ping' --max-turns 1 --output-format json 2>/dev/null")
+    if cfg!(windows) {
+        if shell == "cmd" {
+            command.arg("/C");
+        } else {
+            // pwsh or powershell
+            command.arg("-Command");
+        }
+    } else {
+        command.arg("-l").arg("-c");
+    }
+
+    command
+        .arg("claude -p \"ping\" --max-turns 1 --output-format json")
+        .stderr(std::process::Stdio::null());
+
+    let output = command
         .output()
         .await
         .map_err(|e| e.to_string())?;
