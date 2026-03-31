@@ -122,41 +122,56 @@ fn load_all_sessions_from_disk() -> Vec<SessionMetadata> {
 
 // --- Detection & Installation ---
 
+/// gtedit: 2026.03.30
+/// Return a "shell"-appropriate default command based on a given "shell"
+fn create_shell_command(shell: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(shell);
+    if cfg!(windows) {
+        if shell == "cmd" {
+            command.arg("/C");
+        } else {
+            // pwsh or powershell
+            command.arg("-Command");
+        }
+    } else {
+        command.arg("-l").arg("-c");
+    }
+    command
+}
+
 /// gtedit: 2026.03.26
 /// Return a platform-appropriate preferred shell/program the frontend can use
 /// when asking the backend to run user-visible shell commands. This does NOT
 /// execute anything — it only reports which shell the frontend should invoke
 /// or show to the user (e.g. "pwsh" on Windows, login shell on macOS/Linux).
+/// Note that cmd is more reliable here - powershell has some security checks
+/// that aren't easy to deal with dyanmically without bypassing them entirely...
+/// Default to cmd in Windows unless it really does not exist - 
+/// in which case we will deal with that when we get there...
 fn resolve_shell() -> String {
     if cfg!(windows) {
-        if is_executable_in_path("pwsh") {
-            "pwsh".to_string()
-        } else if is_executable_in_path("powershell") {
-            "powershell".to_string()
-        } else {
+        if is_executable_in_path("cmd", None) {
             "cmd".to_string()
-        }
-    } else {
+        } //else if is_executable_in_path("pwsh", None) {
+        //    "pwsh".to_string()
+        //} else {
+        //    "powershell".to_string()
+        //}
+    } else if cfg!(target_os = "macos") {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
 }
 
-/// gtedit: 2026.03.26
+/// gtedit: 2026.03.30
+/// Wrapper that creates a tokio process with default login arguments and given command
+/// Note that in an async context, you must use .output().await
 /// Helper: run a command through the user's login shell or relevant windows exe to get proper PATH
-fn login_shell_cmd(command: &str) -> std::process::Command {
+fn login_shell_cmd(command: &str) -> tokio::process::Command {
     let shell = resolve_shell();
-    let mut cmd = std::process::Command::new(&shell);
-
-    if cfg!(windows) {
-        if shell == "cmd" {
-            cmd.arg("/C").arg(command);
-        } else {
-            // pwsh or powershell
-            cmd.arg("-Command").arg(command);
-        }
-    } else {
-        cmd.arg("-l").arg("-c").arg(command);
-    }
+    let cmd = create_shell_command(&shell)
+        .arg(command);
 
     cmd
 }
@@ -172,9 +187,16 @@ pub async fn detect_platform() -> Result<String, String> {
 
 // Small helper to check whether an executable exists on PATH. We check a few
 // common extensions on Windows so callers can probe for things like `winget`.
-fn is_executable_in_path(name: &str) -> bool {
+// An optional custom_path can be provided to search a modified PATH instead
+// of the system PATH.
+fn is_executable_in_path(name: &str, custom_path: Option<&str>) -> bool {
     use std::path::Path;
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    use std::ffi::OsString;
+
+    let path_var: OsString = match custom_path {
+        Some(p) => OsString::from(p),
+        None => std::env::var_os("PATH").unwrap_or_default(),
+    };
     let paths = std::env::split_paths(&path_var);
     let exts: Vec<&str> = if cfg!(windows) {
         vec!["", ".exe", ".cmd", ".bat", ".ps1"]
@@ -212,29 +234,29 @@ pub async fn detect_installers() -> Result<Vec<String>, String> {
 
     match os {
         "windows" => {
-            if is_executable_in_path("winget") { available.push("winget".to_string()); }
-            if is_executable_in_path("choco") { available.push("choco".to_string()); }
-            if is_executable_in_path("scoop") { available.push("scoop".to_string()); }
-            if is_executable_in_path("pwsh") || is_executable_in_path("powershell") {
+            if is_executable_in_path("winget", None) { available.push("winget".to_string()); }
+            if is_executable_in_path("choco", None) { available.push("choco".to_string()); }
+            if is_executable_in_path("scoop", None) { available.push("scoop".to_string()); }
+            if is_executable_in_path("pwsh", None) || is_executable_in_path("powershell", None) {
                 available.push("powershell".to_string());
             }
             // Always offer manual as a fallback option
             available.push("manual".to_string());
         }
         "macos" => {
-            if is_executable_in_path("brew") { available.push("brew".to_string()); }
-            if is_executable_in_path("npm") { available.push("npm".to_string()); }
-            if is_executable_in_path("curl") { available.push("curl".to_string()); }
+            if is_executable_in_path("brew", None) { available.push("brew".to_string()); }
+            if is_executable_in_path("npm", None) { available.push("npm".to_string()); }
+            if is_executable_in_path("curl", None) { available.push("curl".to_string()); }
             available.push("manual".to_string());
         }
         _ => {
             // Linux/other
-            if is_executable_in_path("apt") { available.push("apt".to_string()); }
-            if is_executable_in_path("dnf") { available.push("dnf".to_string()); }
-            if is_executable_in_path("yum") { available.push("yum".to_string()); }
-            if is_executable_in_path("snap") { available.push("snap".to_string()); }
-            if is_executable_in_path("npm") { available.push("npm".to_string()); }
-            if is_executable_in_path("curl") { available.push("curl".to_string()); }
+            if is_executable_in_path("apt", None) { available.push("apt".to_string()); }
+            if is_executable_in_path("dnf", None) { available.push("dnf".to_string()); }
+            if is_executable_in_path("yum", None) { available.push("yum".to_string()); }
+            if is_executable_in_path("snap", None) { available.push("snap".to_string()); }
+            if is_executable_in_path("npm", None) { available.push("npm".to_string()); }
+            if is_executable_in_path("curl", None) { available.push("curl".to_string()); }
             available.push("manual".to_string());
         }
     }
@@ -244,7 +266,7 @@ pub async fn detect_installers() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub async fn check_claude_installed() -> Result<ClaudeStatus, String> {
-    let which = match login_shell_cmd("which claude").output() {
+    let which = match login_shell_cmd("which claude").output().await {
         Ok(o) => o,
         Err(_) => {
             return Ok(ClaudeStatus {
@@ -265,7 +287,7 @@ pub async fn check_claude_installed() -> Result<ClaudeStatus, String> {
 
     let path = String::from_utf8_lossy(&which.stdout).trim().to_string();
 
-    let version_output = login_shell_cmd("claude --version").output().ok();
+    let version_output = login_shell_cmd("claude --version").output().await.ok();
 
     let version = version_output
         .filter(|o| o.status.success())
@@ -281,52 +303,79 @@ pub async fn check_claude_installed() -> Result<ClaudeStatus, String> {
 #[tauri::command]
 pub async fn install_claude(method: String) -> Result<(), String> {
     // Already installed?
-    let has_claude = login_shell_cmd("claude --version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if has_claude {
+    if check_version("claude", "--version", None).await.is_some() {
         return Ok(());
     }
 
-    // Primary method: official curl installer (works regardless of `method` param)
-    eprintln!("[Claude Code] Attempting install via official installer...");
-    let output = login_shell_cmd("curl -fsSL https://claude.ai/install.sh | bash").output();
+    // Primary method: platform-specific native installer
+    eprintln!("[Claude Code] Attempting install via native installer...");
 
+    let native_cmd = if cfg!(target_os = "windows") {
+        let shell = resolve_shell();
+        if shell != "cmd" {
+            // pwsh or powershell
+            "irm https://claude.ai/install.ps1 | iex"
+        } else {
+            "curl -fsSL https://claude.ai/install.cmd -o install.cmd && install.cmd && del install.cmd"
+        }
+    } else {
+        "curl -fsSL https://claude.ai/install.sh | bash"
+    };
+
+    let output = login_shell_cmd(native_cmd).output().await;
+    
+    // TODO: deal with install path not on PATH
     match output {
         Ok(ref o) if o.status.success() => {
-            eprintln!("[Claude Code] Installed successfully via curl installer");
-            // Verify the binary is accessible
-            let check = login_shell_cmd("claude --version").output();
-            if check.map(|c| c.status.success()).unwrap_or(false) {
+            eprintln!("[Claude Code] Installed successfully via native installer");
+            if check_version("claude", "--version", None).await.is_some() {
                 return Ok(());
             }
-            // Also check common install location directly
+            // Also check common install location directly (Unix only)
+            #[cfg(not(target_os = "windows"))]
             if let Some(home) = dirs::home_dir() {
                 if home.join(".claude/local/bin/claude").exists() {
+                    return Ok(());
+                }
+            }
+            // Also check common install location directly (Windows)
+            #[cfg(target_os = "windows")]
+            if let Some(home) = dirs::home_dir() {
+                if home.join(".local/bin/claude.exe").exists() {
                     return Ok(());
                 }
             }
         }
         Ok(ref o) => {
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            eprintln!("[Claude Code] Curl installer failed: {}", stderr);
+            eprintln!("[Claude Code] Native installer failed: {}", stderr);
         }
         Err(e) => {
-            eprintln!("[Claude Code] Curl installer error: {}", e);
+            eprintln!("[Claude Code] Native installer error: {}", e);
+        }
+    }
+    /////START HERE/////
+    // Fallback method: npm install (cross-platform)
+    eprintln!("[Claude Code] Attempting install via npm...");
+    // Check if npm installed
+    if check_version("npm", "--version", None).await.is_some() {
+        let output = login_shell_cmd("npm install -g @anthropic-ai/claude-code").output().await;
+        if let Ok(o) = output {
+            if o.status.success() { return Ok(()); }
         }
     }
 
-    // Fallback: npm install (for systems where curl installer doesn't work)
-    eprintln!("[Claude Code] Falling back to npm install...");
 
-    let npm_path = if std::path::Path::new("/opt/homebrew/bin/npm").exists() {
-        "/opt/homebrew/bin/npm"
-    } else if std::path::Path::new("/usr/local/bin/npm").exists() {
-        "/usr/local/bin/npm"
-    } else {
-        "npm"
-    };
+    // Fallback: npm install (for systems where curl installer doesn't work)
+    //eprintln!("[Claude Code] Falling back to npm install...");
+
+    //let npm_path = if std::path::Path::new("/opt/homebrew/bin/npm").exists() {
+    //    "/opt/homebrew/bin/npm"
+    //} else if std::path::Path::new("/usr/local/bin/npm").exists() {
+    //    "/usr/local/bin/npm"
+    //} else {
+    //    "npm"
+    //};
 
     let shell_command = match method.as_str() {
         "brew" => {
@@ -342,7 +391,7 @@ pub async fn install_claude(method: String) -> Result<(), String> {
         _ => format!("{} install -g @anthropic-ai/claude-code", npm_path),
     };
 
-    let npm_output = login_shell_cmd(&shell_command).output();
+    let npm_output = login_shell_cmd(&shell_command).output().await;
 
     match npm_output {
         Ok(ref o) if o.status.success() => {
@@ -433,87 +482,117 @@ pub struct DependencyStatus {
     pub claude_version: Option<String>,
 }
 
-/// Check all local dependencies needed for Claude Code
-#[tauri::command]
-pub async fn check_local_dependencies() -> Result<DependencyStatus, String> {
+/// gtedit: 2026.03.30
+///START HERE///
+/// Small helpers that check for specific dependencies and/or define environment variables
+fn set_augmented_path(extra_path: Option<&str>) -> String {
+    use std::ffi::OsString;
+
+    let path_var: OsString = match extra_path {
+        Some(p) => OsString::from(p),
+        None => std::env::var_os("PATH").unwrap_or_default(),
+    };   
+
     // Build an augmented PATH that includes Homebrew and Operon-managed Node locations.
     // This is necessary because after a fresh install, the GUI app's login shell
     // may not yet see the updated PATH.
-    let operon_bin = operon_node_dir().join("bin").to_string_lossy().to_string();
-    let extra_paths = format!("{}:/opt/homebrew/bin:/usr/local/bin", operon_bin);
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let augmented_path = format!("{}:{}", extra_paths, current_path);
+    let os = std::env::consts::OS;
 
-    // Helper: run a command with augmented PATH via login shell
-    let check_cmd = |cmd: &str| -> Option<std::process::Output> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        std::process::Command::new(&shell)
-            .arg("-l")
-            .arg("-c")
-            .arg(cmd)
-            .env("PATH", &augmented_path)
-            .output()
-            .ok()
+    // TODO: adjust "bin" for windows...check how operon installs nodejs on windows
+    let operon_bin = operon_node_dir().join("bin").to_string_lossy().to_string();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+
+    let augmented_path = match os {
+        "windows" => {
+            // Windows uses ; as PATH separator
+            // Common Node.js location on Windows
+            format!("{};{};C:\\Program Files\\nodejs;{}", operon_bin, path_var, current_path)
+        }
+        "macos" => {
+            // macOS uses : as PATH separator, include Homebrew paths
+            format!("{}:{}:/opt/homebrew/bin:/usr/local/bin:{}", operon_bin, path_var, current_path)
+        }
+        _ => {
+            // Linux/other — no extra paths needed beyond operon_bin
+            format!("{}:{}:{}", operon_bin, path_var, current_path)
+        }
     };
 
-    // Check Xcode CLI tools
-    let xcode = check_cmd("xcode-select -p")
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    augmented_path
+}
+
+async fn check_cmd(cmd: &str, custom_path: Option<&str>) -> Option<std::process::Output> {
+    use std::ffi::OsString;
+
+    let path_var: OsString = match custom_path {
+        Some(p) => OsString::from(p),
+        None => std::env::var_os("PATH").unwrap_or_default(),
+    };    
+
+    login_shell_cmd(cmd) // tokio process with default shell-specific args
+        .env("PATH", &path_var)
+        .output().await
+        .ok()
+}
+
+// If this command succeeds, return Some(version String)
+// If this command fails, then return None
+async fn check_version(cmd: &str, version_flag: &str, custom_path: Option<&str>) -> Option<String> {
+    use std::ffi::OsString;
+
+    // Try through login shell first
+    let mut version = check_cmd(&format!("{} {}", cmd, version_flag), custom_path)
+        .await
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Fallback: check if executable exists in augmented PATH and run directly
+    if version.is_none() {
+        let path_var: OsString = match custom_path {
+            Some(p) => OsString::from(p),
+            None => std::env::var_os("PATH").unwrap_or_default(),
+        };
+
+        if is_executable_in_path(cmd, path_var.to_str()) {
+            if let Ok(out) = tokio::process::Command::new(cmd)
+                .arg(version_flag)
+                .env("PATH", &path_var)
+                .output().await
+            {
+                if out.status.success() {
+                    version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+                }
+            }
+        }
+    }
+    version
+}
+
+/// Check all local dependencies needed for Claude Code
+#[tauri::command]
+pub async fn check_local_dependencies() -> Result<DependencyStatus, String> {
+    let augmented_path = set_augmented_path();
+
+    // check xcode only if mac
+    let xcode = if cfg!(target_os = "macos") {
+        check_cmd("xcode-select -p", Some(&augmented_path)).await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
     // Check Node.js — try login shell first, then check Homebrew paths directly
-    let node_out = check_cmd("node --version");
-    let mut node = node_out.as_ref().map_or(false, |o| o.status.success());
-    let mut node_version = node_out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    // Fallback: check Operon-managed and Homebrew node directly
-    if !node {
-        let operon_node = operon_node_dir().join("bin").join("node");
-        let operon_node_str = operon_node.to_string_lossy().to_string();
-        for node_path in &[operon_node_str.as_str(), "/opt/homebrew/bin/node", "/usr/local/bin/node"] {
-            if std::path::Path::new(node_path).exists() {
-                if let Ok(out) = std::process::Command::new(node_path).arg("--version").output() {
-                    if out.status.success() {
-                        node = true;
-                        node_version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let node_version = check_version("node", "--version", Some(&augmented_path)).await;
+    let node = node_version.is_some();
 
     // Check npm
-    let npm_out = check_cmd("npm --version");
-    let mut npm = npm_out.as_ref().map_or(false, |o| o.status.success());
-    let mut npm_version = npm_out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    if !npm {
-        let operon_npm = operon_node_dir().join("bin").join("npm");
-        let operon_npm_str = operon_npm.to_string_lossy().to_string();
-        for npm_path in &[operon_npm_str.as_str(), "/opt/homebrew/bin/npm", "/usr/local/bin/npm"] {
-            if std::path::Path::new(npm_path).exists() {
-                if let Ok(out) = std::process::Command::new(npm_path).arg("--version").output() {
-                    if out.status.success() {
-                        npm = true;
-                        npm_version = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let npm_version = check_version("npm", "--version", Some(&augmented_path)).await;
+    let npm = npm_version.is_some();
 
     // Check Claude Code
-    let claude_out = check_cmd("claude --version");
-    let claude_code = claude_out.as_ref().map_or(false, |o| o.status.success());
-    let claude_version = claude_out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let claude_version = check_version("claude", "--version", Some(&augmented_path)).await;
+    let claude = claude_version.is_some();
 
     Ok(DependencyStatus {
         xcode_cli: xcode,
@@ -531,7 +610,7 @@ pub async fn check_local_dependencies() -> Result<DependencyStatus, String> {
 pub async fn install_xcode_cli() -> Result<(), String> {
     // First check if already installed
     let check = login_shell_cmd("xcode-select -p")
-        .output()
+        .output().await
         .map(|o| o.status.success())
         .unwrap_or(false);
     if check {
@@ -674,7 +753,7 @@ fn install_node_tarball() -> Result<(), String> {
 pub async fn install_node() -> Result<(), String> {
     // Already installed?
     let has_node = login_shell_cmd("node --version")
-        .output()
+        .output().await
         .map(|o| o.status.success())
         .unwrap_or(false);
     if has_node {
@@ -697,7 +776,7 @@ pub async fn install_node() -> Result<(), String> {
 
     if let Some(brew) = brew_path {
         eprintln!("[Node] Trying Homebrew...");
-        let output = login_shell_cmd(&format!("{} install node", brew)).output();
+        let output = login_shell_cmd(&format!("{} install node", brew)).output().await;
         if let Ok(o) = output {
             if o.status.success() { return Ok(()); }
         }
@@ -906,7 +985,7 @@ fn emit_install_progress(app: &tauri::AppHandle, step: &str, status: &str, messa
 #[tauri::command]
 pub async fn install_phase_xcode(app: tauri::AppHandle) -> Result<bool, String> {
     let already = login_shell_cmd("xcode-select -p")
-        .output().map(|o| o.status.success()).unwrap_or(false);
+        .output().await.map(|o| o.status.success()).unwrap_or(false);
 
     if already {
         emit_install_progress(&app, "xcode", "skipped", "Xcode Command Line Tools already installed", 100);
@@ -926,7 +1005,7 @@ pub async fn install_phase_xcode(app: tauri::AppHandle) -> Result<bool, String> 
     for i in 0..480_u32 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let check = login_shell_cmd("xcode-select -p")
-            .output().map(|o| o.status.success()).unwrap_or(false);
+            .output().await.map(|o| o.status.success()).unwrap_or(false);
         if check {
             emit_install_progress(&app, "xcode", "complete", "Xcode Command Line Tools installed!", 100);
             return Ok(true);
@@ -979,7 +1058,7 @@ pub async fn install_phase_tools(app: tauri::AppHandle) -> Result<bool, String> 
 
     // ── Node.js (50-80%) ──
     let has_node = login_shell_cmd("node --version")
-        .output().map(|o| o.status.success()).unwrap_or(false)
+        .output().await.map(|o| o.status.success()).unwrap_or(false)
         || operon_node_bin().is_some();
 
     if !has_node {
@@ -1015,14 +1094,14 @@ pub async fn install_phase_tools(app: tauri::AppHandle) -> Result<bool, String> 
             all_ok = false;
         }
     } else {
-        let ver = login_shell_cmd("node --version").output()
+        let ver = login_shell_cmd("node --version").output().await
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         emit_install_progress(&app, "node", "skipped",
             &format!("Node.js already installed ({})", ver), 80);
     }
 
     // ── GitHub CLI (80-100%) ──
-    let has_gh = login_shell_cmd("which gh").output()
+    let has_gh = login_shell_cmd("which gh").output().await
         .map(|o| o.status.success()).unwrap_or(false);
 
     if !has_gh {
@@ -1116,11 +1195,11 @@ pub async fn install_phase_tools(app: tauri::AppHandle) -> Result<bool, String> 
 /// Falls back to npm if curl installer fails.
 #[tauri::command]
 pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String> {
-    let has_claude = login_shell_cmd("which claude").output()
+    let has_claude = login_shell_cmd("which claude").output().await
         .map(|o| o.status.success()).unwrap_or(false);
 
     if has_claude {
-        let ver = login_shell_cmd("claude --version").output()
+        let ver = login_shell_cmd("claude --version").output().await
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         emit_install_progress(&app, "claude", "skipped",
             &format!("Claude Code already installed ({})", ver), 100);
@@ -1132,7 +1211,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
         "Installing Claude Code via official installer...", 20);
     eprintln!("[Claude] Attempting install via curl installer...");
 
-    let curl_output = login_shell_cmd("curl -fsSL https://claude.ai/install.sh | bash").output();
+    let curl_output = login_shell_cmd("curl -fsSL https://claude.ai/install.sh | bash").output().await;
 
     let mut claude_installed = false;
 
@@ -1140,7 +1219,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
         Ok(o) if o.status.success() => {
             eprintln!("[Claude] Curl installer succeeded");
             // Source updated profile so `claude` is in PATH for subsequent checks
-            let check = login_shell_cmd("claude --version").output();
+            let check = login_shell_cmd("claude --version").output().await;
             if let Ok(c) = check {
                 if c.status.success() {
                     claude_installed = true;
@@ -1176,7 +1255,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
                 } else if std::path::Path::new("/usr/local/bin/npm").exists() {
                     Some("/usr/local/bin/npm".to_string())
                 } else {
-                    login_shell_cmd("which npm").output().ok()
+                    login_shell_cmd("which npm").output().await.ok()
                         .filter(|o| o.status.success())
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 }
@@ -1185,7 +1264,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
         if let Some(npm) = npm_cmd {
             eprintln!("[Claude] Using npm at: {}", npm);
             let install_cmd = format!("{} install -g @anthropic-ai/claude-code", npm);
-            let output = login_shell_cmd(&install_cmd).output();
+            let output = login_shell_cmd(&install_cmd).output().await;
 
             match output {
                 Ok(o) if o.status.success() => { claude_installed = true; }
@@ -1202,7 +1281,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
                         let npm_global = home.join(".npm-global");
                         let _ = std::fs::create_dir_all(&npm_global);
                         let _ = login_shell_cmd(&format!("{} config set prefix {}", npm,
-                            npm_global.to_string_lossy())).output();
+                            npm_global.to_string_lossy())).output().await;
 
                         let zprofile = home.join(".zprofile");
                         let path_line = format!("\nexport PATH=\"{}:$PATH\"\n",
@@ -1218,7 +1297,7 @@ pub async fn install_phase_claude(app: tauri::AppHandle) -> Result<bool, String>
                         let retry = login_shell_cmd(&format!(
                             "export PATH={}:$PATH && {} install -g @anthropic-ai/claude-code",
                             npm_global.join("bin").to_string_lossy(), npm
-                        )).output();
+                        )).output().await;
                         if let Ok(r) = retry {
                             if r.status.success() { claude_installed = true; }
                         }
@@ -1604,18 +1683,7 @@ pub async fn check_oauth_status() -> Result<bool, String> {
     /// adjusts shell commands based on preferred shell
     // Slow path: actually run claude through a login shell to test auth
     let shell = resolve_shell();
-    let mut command = tokio::process::Command::new(&shell);
-
-    if cfg!(windows) {
-        if shell == "cmd" {
-            command.arg("/C");
-        } else {
-            // pwsh or powershell
-            command.arg("-Command");
-        }
-    } else {
-        command.arg("-l").arg("-c");
-    }
+    let mut command = create_shell_command(&shell);
 
     command
         .arg("claude -p \"ping\" --max-turns 1 --output-format json")
@@ -1738,6 +1806,8 @@ pub async fn start_claude_session(
                 .find(|p| p.id == ctx.profile_id)
                 .cloned()
         };
+
+        //TODO: make Windows friendly
         if let Some(prof) = profile {
             let check_cmd = format!(
                 "cat '{}'/implementation_plan.md 2>/dev/null || echo ''",
@@ -1747,6 +1817,7 @@ pub async fn start_claude_session(
         } else {
             String::new()
         }
+
     } else {
         // Local: read implementation_plan.md from project path
         let plan_path = std::path::Path::new(&project_path).join("implementation_plan.md");
@@ -1845,6 +1916,7 @@ pub async fn start_claude_session(
                 let profiles = ssh_state.profiles.lock().map_err(|e| e.to_string())?;
                 profiles.iter().find(|p| p.id == ctx.profile_id).cloned()
             };
+            // TODO: make Windows friendly
             if let Some(prof) = profile {
                 let archive_cmd = format!(
                     "mkdir -p '{base}/.operon/plan_history' && \
@@ -1864,6 +1936,7 @@ pub async fn start_claude_session(
         }
     }
 
+    // TODO: make commands windows friendly
     let mut claude_cmd = match mode.as_str() {
         "plan" => {
             // Plan mode: write a FRESH implementation_plan.md
@@ -2030,8 +2103,8 @@ pub async fn start_claude_session(
         // Shell-escape the path in case it contains spaces
         claude_cmd.push_str(&format!(" --mcp-config '{}'", config_path.replace('\'', "'\\''")));
     }
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    
+    let shell = resolve_shell();
 
     let use_terminal = use_terminal.unwrap_or(false);
 
@@ -2992,7 +3065,7 @@ pub async fn reconnect_session(
     let output_file = format!("{}/.operon-{}.jsonl", base_path, session_id);
     let done_file = format!("{}/.operon-{}.done", base_path, session_id);
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = resolve_shell();
 
     if let Some(ctx) = remote {
         let profile = {
