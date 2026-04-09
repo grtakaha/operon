@@ -152,16 +152,95 @@ fn resolve_shell() -> String {
     if cfg!(windows) {
         if is_executable_in_path("cmd", None) {
             "cmd".to_string()
-        } //else if is_executable_in_path("pwsh", None) {
-        //    "pwsh".to_string()
-        //} else {
-        //    "powershell".to_string()
-        //}
+        } else if is_executable_in_path("pwsh", None) {
+            "pwsh".to_string()
+        } else if is_executable_in_path("powershell", None) {
+            "powershell".to_string()
+        } else {
+            // Last resort
+            "cmd".to_string()
+        }
     } else if cfg!(target_os = "macos") {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
+}
+
+/// gtedit: 2026.03.30
+/// Detect a tool's full path by probing extra candidates, PATH, and falling back to `which/where`.
+/// Returns the absolute path to the executable if found.
+fn detect_tool(name: &str, extra_candidates: Option<&[&str]>, custom_path: Option<&str>) -> Option<String> {
+    use std::path::Path;
+    use std::ffi::OsString;
+
+    // 1) Explicit candidate list (absolute paths)
+    if let Some(cands) = extra_candidates {
+        for &c in cands {
+            let p = Path::new(c);
+            if p.exists() && p.is_file() {
+                if let Ok(canon) = p.canonicalize() {
+                    return Some(canon.to_string_lossy().to_string());
+                } else {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // 2) Search PATH (or provided custom_path)
+    let path_var: OsString = match custom_path {
+        Some(p) => OsString::from(p),
+        None => std::env::var_os("PATH").unwrap_or_default(),
+    };
+
+    let pathexts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.PS1".to_string())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&path_var) {
+        if cfg!(windows) {
+            for ext in &pathexts {
+                let candidate = dir.join(format!("{}{}", name, ext));
+                if candidate.exists() && candidate.is_file() {
+                    if let Ok(canon) = candidate.canonicalize() {
+                        return Some(canon.to_string_lossy().to_string());
+                    } else {
+                        return Some(candidate.to_string_lossy().to_string());
+                    }
+                }
+            }
+        } else {
+            let candidate = dir.join(name);
+            if candidate.exists() && candidate.is_file() {
+                if let Ok(canon) = candidate.canonicalize() {
+                    return Some(canon.to_string_lossy().to_string());
+                } else {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // 3) Fallback to which/where
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(out) = std::process::Command::new(probe).arg(name).output() {
+        if out.status.success() {
+            if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                let s = line.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// gtedit: 2026.03.30
@@ -266,6 +345,18 @@ pub async fn detect_installers() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub async fn check_claude_installed() -> Result<ClaudeStatus, String> {
+    // Prefer a fast local probe for the full path
+    if let Some(path) = detect_tool("claude", None, None) {
+        // Try to get version via the detected path
+        let version = check_version(&path, "--version", None).await;
+        return Ok(ClaudeStatus {
+            installed: true,
+            version,
+            path: Some(path),
+        });
+    }
+
+    // Fallback: try through the login shell (PATH may differ)
     let which = match login_shell_cmd("which claude").output().await {
         Ok(o) => o,
         Err(_) => {
@@ -286,12 +377,7 @@ pub async fn check_claude_installed() -> Result<ClaudeStatus, String> {
     }
 
     let path = String::from_utf8_lossy(&which.stdout).trim().to_string();
-
-    let version_output = login_shell_cmd("claude --version").output().await.ok();
-
-    let version = version_output
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let version = check_version(&path, "--version", None).await;
 
     Ok(ClaudeStatus {
         installed: true,
@@ -377,6 +463,10 @@ pub async fn install_claude(method: String) -> Result<(), String> {
     //    "npm"
     //};
 
+    // Prepare npm executable path (prefer operon-managed, else try to detect in augmented PATH)
+    let augmented_path = set_augmented_path(None);
+    let npm_bin = operon_npm_bin().or_else(|| detect_tool("npm", None, Some(&augmented_path))).unwrap_or_else(|| "npm".to_string());
+
     let shell_command = match method.as_str() {
         "brew" => {
             let brew_path = if std::path::Path::new("/opt/homebrew/bin/brew").exists() {
@@ -388,7 +478,7 @@ pub async fn install_claude(method: String) -> Result<(), String> {
             };
             format!("{} install --cask claude-code", brew_path)
         }
-        _ => format!("{} install -g @anthropic-ai/claude-code", npm_path),
+        _ => format!("{} install -g @anthropic-ai/claude-code", npm_bin),
     };
 
     let npm_output = login_shell_cmd(&shell_command).output().await;
@@ -485,13 +575,25 @@ pub struct DependencyStatus {
 /// gtedit: 2026.03.30
 ///START HERE///
 /// Small helpers that check for specific dependencies and/or define environment variables
-fn set_augmented_path(extra_path: Option<&str>) -> String {
+fn set_augmented_path(extra_paths: Option<&[&str]>) -> String {
     use std::ffi::OsString;
 
-    let path_var: OsString = match extra_path {
-        Some(p) => OsString::from(p),
-        None => std::env::var_os("PATH").unwrap_or_default(),
-    };   
+    // Determine the separator for the current OS
+    let sep = if cfg!(windows) { ";" } else { ":" };
+
+    // Determine the base PATH: join provided extra_paths to system PATH, or fall back to the system PATH
+    let path_var: OsString = {
+        let system_path = std::env::var_os("PATH").unwrap_or_default();
+        match extra_paths {
+            Some(paths) => {
+                let mut combined = paths.join(sep);
+                combined.push_str(sep);
+                combined.push_str(&system_path.to_string_lossy());
+                OsString::from(combined)
+            }
+            None => system_path,
+        }
+    };
 
     // Build an augmented PATH that includes Homebrew and Operon-managed Node locations.
     // This is necessary because after a fresh install, the GUI app's login shell
@@ -500,21 +602,21 @@ fn set_augmented_path(extra_path: Option<&str>) -> String {
 
     // TODO: adjust "bin" for windows...check how operon installs nodejs on windows
     let operon_bin = operon_node_dir().join("bin").to_string_lossy().to_string();
-    let current_path = std::env::var("PATH").unwrap_or_default();
+    let path_str = path_var.to_string_lossy().to_string();
 
     let augmented_path = match os {
         "windows" => {
             // Windows uses ; as PATH separator
             // Common Node.js location on Windows
-            format!("{};{};C:\\Program Files\\nodejs;{}", operon_bin, path_var, current_path)
+            format!("{};C:\\Program Files\\nodejs;{}", operon_bin, path_str)
         }
         "macos" => {
             // macOS uses : as PATH separator, include Homebrew paths
-            format!("{}:{}:/opt/homebrew/bin:/usr/local/bin:{}", operon_bin, path_var, current_path)
+            format!("{}:/opt/homebrew/bin:/usr/local/bin:{}", operon_bin, path_str)
         }
         _ => {
             // Linux/other — no extra paths needed beyond operon_bin
-            format!("{}:{}:{}", operon_bin, path_var, current_path)
+            format!("{}:{}", operon_bin, path_str)
         }
     };
 
@@ -553,8 +655,15 @@ async fn check_version(cmd: &str, version_flag: &str, custom_path: Option<&str>)
             None => std::env::var_os("PATH").unwrap_or_default(),
         };
 
-        if is_executable_in_path(cmd, path_var.to_str()) {
-            if let Ok(out) = tokio::process::Command::new(cmd)
+        // If `cmd` is a simple name, try to resolve a full path using detect_tool
+        let resolved = if cmd.contains(std::path::MAIN_SEPARATOR) {
+            Some(cmd.to_string())
+        } else {
+            detect_tool(cmd, None, path_var.to_str())
+        };
+
+        if let Some(bin) = resolved {
+            if let Ok(out) = tokio::process::Command::new(&bin)
                 .arg(version_flag)
                 .env("PATH", &path_var)
                 .output().await
