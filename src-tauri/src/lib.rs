@@ -203,8 +203,8 @@ use commands::{
     stop_translation_proxy,
     stop_watchdog,
     store_api_key,
+    teardown_remote_footprint, // manually resolved conflict here - this was new from Vivek's end
     supports_ssh_mux, // unsure why this section is alphabetical...but I'm putting it here
-    teardown_remote_footprint,
     test_custom_endpoint,
     test_ssh_connection,
     translation_proxy_status,
