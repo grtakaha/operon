@@ -437,7 +437,8 @@ impl WinSshExecChannel {
         let delim = format!("__OPERON_DONE_{}_{}__", std::process::id(), ts);
 
         // Send command, capture both stdout and stderr, then print delimiter
-        let wrapped = format!("{} 2>&1; echo \"{}\"\n", remote_cmd, delim);
+        //let wrapped = format!("{} 2>&1; echo \"{}\"\n", remote_cmd, delim);
+        let wrapped = format!("({}) 2>&1; echo \"{}\"\n", remote_cmd, delim);
 
         self.stdin.write_all(wrapped.as_bytes()).map_err(|e| {
             format!(
@@ -2075,6 +2076,11 @@ pub async fn test_ssh_connection(
 
     let result = ssh_exec(&profile, "echo ok && hostname")?;
     Ok(result.trim().to_string())
+}
+
+#[tauri::command]
+pub fn supports_ssh_mux() -> bool {
+    crate::platform::supports_ssh_mux()
 }
 
 /// Check if a ControlMaster connection is active for a profile.

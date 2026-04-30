@@ -78,7 +78,22 @@ pub fn default_shell() -> String {
 // ─── Directories ─────────────────────────────────────────────────
 
 /// The user's home directory.
+/// Return early with USERPROFILE on Windows
+/// and only default to HOME environment var if necessary
+/// HOME is often set incorrectly on Windows by Git for Windows
+/// breaking multi-user installs.
 pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer USERPROFILE over dirs::home_dir() — USERPROFILE is set by
+        // Windows at login for each user individually and is always correct.
+        // dirs::home_dir() checks HOME first, which Git for Windows sometimes
+        // sets as a system-level variable pointing to the installing user's
+        // directory, breaking multi-user installs.
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return Some(std::path::PathBuf::from(profile));
+        }
+    }
     dirs::home_dir()
 }
 

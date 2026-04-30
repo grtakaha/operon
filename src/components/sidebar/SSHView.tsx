@@ -205,8 +205,14 @@ export function SSHView({ onConnectSSH }: SSHViewProps) {
     }
 
     let sshCmd = `ssh ${profile.user}@${profile.host} -p ${profile.port} -o ServerAliveInterval=30`;
+
+    // Check if SSH multiplexing is supported by this OS
+    // Windows does not allow it
+    // backend already handles this, so we're calling it here using the same function
+    const muxSupported = await invoke<boolean>('supports_ssh_mux');
+
     // Add ControlMaster args so the terminal becomes the master connection
-    if (profile.use_control_master) {
+    if (profile.use_control_master && muxSupported) {
       const homeDir = await invoke<string>('get_home_dir').catch(() => '/tmp');
       const sockPath = `${homeDir}/.operon/sockets/ctrl_${profile.host}_${profile.port}_${profile.user}`;
       sshCmd += ` -o ControlMaster=auto -o ControlPath=${sockPath} -o ControlPersist=4h`;

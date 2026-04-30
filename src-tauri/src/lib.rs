@@ -190,6 +190,7 @@ use commands::{
     stop_language_server,
     stop_translation_proxy,
     store_api_key,
+    supports_ssh_mux, // unsure why this section is alphabetical...but I'm putting it here
     test_custom_endpoint,
     test_ssh_connection,
     translation_proxy_status,
@@ -342,6 +343,7 @@ pub fn run() {
             test_ssh_connection,
             check_control_master,
             stop_control_master,
+            supports_ssh_mux,
             // Settings
             get_settings,
             update_settings,

@@ -103,7 +103,18 @@ pub async fn spawn_terminal(
             c
         }
     } else {
-        CommandBuilder::new(&shell)
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(bash_path) = crate::platform::find_git_bash_path() {
+                CommandBuilder::new(&bash_path)
+            } else {
+                CommandBuilder::new(&shell)
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            CommandBuilder::new(&shell)
+        }
     };
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
