@@ -165,6 +165,7 @@ use commands::{
     save_ssh_profile,
     // Report
     scan_project_files,
+    scan_remote_footprint,
     scan_remote_project_files,
     scp_batch_upload,
     scp_dir_from_remote,
@@ -203,6 +204,7 @@ use commands::{
     stop_watchdog,
     store_api_key,
     supports_ssh_mux, // unsure why this section is alphabetical...but I'm putting it here
+    teardown_remote_footprint,
     test_custom_endpoint,
     test_ssh_connection,
     translation_proxy_status,
@@ -306,6 +308,8 @@ pub fn run() {
             check_auth_status,
             start_claude_session,
             stop_claude_session,
+            scan_remote_footprint,
+            teardown_remote_footprint,
             check_existing_plan,
             archive_current_plan,
             list_plan_history,
