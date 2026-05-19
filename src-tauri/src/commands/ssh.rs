@@ -251,10 +251,13 @@ impl SshCache {
 
 // ── Manager State ──
 
+// adding a sessions field here
+// I think that this should keep track of persistent ssh2 sessions
 pub struct SSHManager {
     pub profiles: Mutex<Vec<SSHProfile>>,
     pub active_connections: Mutex<HashMap<String, String>>, // profile_id -> terminal_id
     pub cache: SshCache,
+    sessions: Mutex<HashMap<String, ssh2::Session>>,
 }
 
 impl SSHManager {
@@ -266,10 +269,16 @@ impl SSHManager {
             profiles: Mutex::new(profiles),
             active_connections: Mutex::new(HashMap::new()),
             cache: SshCache::new(10), // 10-second TTL
+            sessions: Mutex::new(HashMap::new()), // part of SSHManager's update
         }
     }
 }
 
+// I think I can remove this now that we are using ssh2::Session for persistent connections,
+// but I'll keep it around for reference in case we need it for something
+// The ssh2 library doesn't support ControlMaster multiplexing, 
+// so on Windows we maintain a single persistent SSH process per server and pipe commands through it — this struct encapsulates that logic.
+/*
 // ── Windows Persistent SSH Exec Channel ──
 // On macOS/Linux, ControlMaster multiplexes all SSH commands through one TCP connection.
 // Windows doesn't support ControlMaster, so university servers that rate-limit SSH
@@ -299,6 +308,7 @@ impl WinSshExecChannel {
             "StrictHostKeyChecking=accept-new",
             "-o",
             "ConnectTimeout=15",
+            "-o", "BatchMode=yes", // might be a problem... but avoids hanging on Duo MFA prompts
             "-o",
             "LogLevel=ERROR",
         ]);
@@ -402,7 +412,7 @@ impl WinSshExecChannel {
         let mut line = String::new();
         let start = std::time::Instant::now();
         loop {
-            if start.elapsed() > std::time::Duration::from_secs(10) {
+            if start.elapsed() > std::time::Duration::from_secs(30) { // changed from 10 to 30 because it was exiting too early on slow connections
                 return Err("Exec channel probe timed out — shell not responding".to_string());
             }
             line.clear();
@@ -477,6 +487,7 @@ impl Drop for WinSshExecChannel {
         let _ = self.child.kill();
     }
 }
+*/
 
 // ── Profile CRUD Commands ──
 
@@ -713,6 +724,157 @@ pub async fn spawn_ssh_terminal(
     Ok(())
 }
 
+// connects a new ssh2::Session with proper authentication (key-based or Duo MFA)
+fn connect_ssh2(profile: &SSHProfile) -> Result<ssh2::Session, String> {
+    use std::net::ToSocketAddrs;
+
+    let addr = format!("{}:{}", profile.host, profile.port);
+    let socket_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("Failed to resolve {}: {}", profile.host, e))?
+        .next()
+        .ok_or_else(|| format!("No address found for {}", profile.host))?;
+
+    let tcp = std::net::TcpStream::connect_timeout(
+        &socket_addr,
+        std::time::Duration::from_secs(15),
+    ).map_err(|e| format!("TCP connect failed: {}", e))?;
+
+    let mut session = ssh2::Session::new()
+        .map_err(|e| format!("Failed to create SSH session: {}", e))?;
+    session.set_tcp_stream(tcp);
+    session.set_blocking(true);
+    session.handshake()
+        .map_err(|e| format!("SSH handshake failed: {}", e))?;
+
+    let available = session.auth_methods(&profile.user)
+        .unwrap_or_else(|_| "unknown");
+    eprintln!("[ssh2] server accepts: {}", available);
+
+    // Attempt public key auth (no passphrase — Operon generates passphrase-free keys)
+    // should print problem on failure
+    if let Some(key) = &profile.key_file {
+        let key_path = std::path::Path::new(key);
+        if key_path.exists() {
+            /*
+            let pub_str = format!("{}.pub", key);
+            let pub_path = std::path::Path::new(&pub_str);
+            let pub_key = if pub_path.exists() { Some(pub_path) } else { None };
+            
+            match session.userauth_pubkey_file(&profile.user, pub_key, key_path, None) {
+                Ok(()) if session.authenticated() => return Ok(session),
+                Ok(()) => eprintln!("[ssh2] pubkey accepted but not authenticated"),
+                Err(e) => eprintln!("[ssh2] pubkey auth failed: {}", e),
+            }
+            */
+            match session.userauth_pubkey_file(&profile.user, None, key_path, None) {
+                Ok(()) if session.authenticated() => return Ok(session),
+                Ok(()) => eprintln!("[ssh2] pubkey accepted but not authenticated"),
+                Err(e) => eprintln!("[ssh2] pubkey auth failed: {}", e),
+            }
+        } else {
+            eprintln!("[ssh2] key file not found at: {}", key);
+        }
+    }
+
+    // TODO: this isn't working on Windows when the key auth fails
+    // Fallback: keyboard-interactive (handles Duo if key auth not available)
+    struct DuoHandler;
+    impl ssh2::KeyboardInteractivePrompt for DuoHandler {
+        fn prompt(&mut self, _: &str, _: &str, prompts: &[ssh2::Prompt<'_>]) -> Vec<String> {
+            prompts.iter().map(|p| {
+                if p.text.to_lowercase().contains("passcode or option") {
+                    "1".to_string()  // auto-select Duo push
+                } else {
+                    String::new()
+                }
+            }).collect()
+        }
+    }
+    session.userauth_keyboard_interactive(&profile.user, &mut DuoHandler)
+        .map_err(|e| format!("Keyboard-interactive auth failed: {}", e))?;
+
+    if session.authenticated() {
+        Ok(session)
+    } else {
+        Err("SSH authentication failed".to_string())
+    }
+}
+
+/// Holds the sessions map lock and provides access to one specific session.
+/// Replaces MutexGuard::map which requires nightly Rust.
+struct SessionGuard<'a> {
+    guard: std::sync::MutexGuard<'a, HashMap<String, ssh2::Session>>,
+    key: String,
+}
+
+impl<'a> std::ops::Deref for SessionGuard<'a> {
+    type Target = ssh2::Session;
+    fn deref(&self) -> &Self::Target {
+        self.guard.get(&self.key).expect("session key missing from map")
+    }
+}
+
+impl<'a> std::ops::DerefMut for SessionGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.get_mut(&self.key).expect("session key missing from map")
+    }
+}
+
+// should reconnect to an existing ssh2::Session or creates a new one if needed
+// should use updated session guard (above)
+fn get_session<'a>(
+    state: &'a SSHManager,
+    profile: &SSHProfile,
+) -> Result<SessionGuard<'a>, String> {
+    let key = format!("{}@{}:{}", profile.user, profile.host, profile.port);
+    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+
+    let alive = sessions.get_mut(&key)
+        .map(|s| s.keepalive_send().is_ok())
+        .unwrap_or(false);
+
+    if !alive {
+        sessions.remove(&key);
+        let session = connect_ssh2(profile)?;
+        sessions.insert(key.clone(), session);
+    }
+
+    Ok(SessionGuard { guard: sessions, key })
+}
+
+/// Run a command on a remote server via SSH.
+/// Uses a persistent ssh2::Session (one per server), reused across all calls.
+pub(crate) fn ssh_exec(
+    state: &SSHManager,
+    profile: &SSHProfile,
+    remote_cmd: &str,
+) -> Result<String, String> {
+    // removed mut because of tauri recommendation
+    let session_guard = get_session(state, profile)?;
+
+    let mut channel = session_guard
+        .channel_session()
+        .map_err(|e| format!("Failed to open exec channel: {}", e))?;
+
+    channel
+        .exec(remote_cmd)
+        .map_err(|e| format!("Failed to exec command: {}", e))?;
+
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut channel, &mut output)
+        .map_err(|e| format!("Failed to read output: {}", e))?;
+
+    channel
+        .wait_close()
+        .map_err(|e| format!("Channel close failed: {}", e))?;
+
+    Ok(output)
+    // session_guard drops here, releasing the mutex
+}
+
+// replacing with ssh2-based ssh_exec
+/*
 // ── Remote Command Execution (uses ControlMaster when available) ──
 
 /// Run a command on a remote server via SSH.
@@ -847,6 +1009,7 @@ pub(crate) fn ssh_exec(profile: &SSHProfile, remote_cmd: &str) -> Result<String,
     #[cfg(target_os = "windows")]
     unreachable!()
 }
+*/
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -885,6 +1048,35 @@ pub async fn list_remote_directory(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
+    let mut session_guard = get_session(&state, &profile)?;
+    let sftp = session_guard.sftp()
+        .map_err(|e| format!("Failed to open SFTP subsystem: {}", e))?;
+    let raw = sftp.readdir(std::path::Path::new(&path))
+        .map_err(|e| format!("SFTP readdir failed: {}", e))?;
+
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let base_path = if path.ends_with('/') { path.clone() } else { format!("{}/", path) };
+
+    for (entry_path, stat) in raw {
+        let name = entry_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name == "." || name == ".." || name.is_empty() { continue; }
+        if !show_hidden && name.starts_with('.') { continue; }
+
+        let is_dir = stat.is_dir();
+        let size = stat.size.unwrap_or(0);
+        let full_path = format!("{}{}", base_path, name);
+        let extension = if !is_dir {
+            name.rsplit('.').next()
+                .and_then(|e| if e != name { Some(e.to_string()) } else { None })
+        } else { None };
+
+        entries.push(FileEntry { name, path: full_path, is_dir, size, extension });
+    }
+    // trying to replace with SFTP tools
+    /*
     let ls_flag = if show_hidden { "-1aFL" } else { "-1FL" };
     let la_flag = if show_hidden { "-laL" } else { "-lL" };
     let cmd = format!(
@@ -895,7 +1087,7 @@ pub async fn list_remote_directory(
         shell_escape_inner(&path)
     );
 
-    let output = ssh_exec(&profile, &cmd)?;
+    let output = ssh_exec(&state, &profile, &cmd)?;
 
     let parts: Vec<&str> = output.splitn(2, "---SEPARATOR---").collect();
     let names_output = parts.first().unwrap_or(&"");
@@ -952,6 +1144,7 @@ pub async fn list_remote_directory(
             extension,
         });
     }
+    */
 
     entries.sort_by(|a, b| {
         b.is_dir
@@ -979,7 +1172,7 @@ pub async fn get_remote_home(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
-    let output = ssh_exec(&profile, "echo $HOME")?;
+    let output = ssh_exec(&state, &profile, "echo $HOME")?;
     Ok(output.trim().to_string())
 }
 
@@ -1004,7 +1197,19 @@ pub async fn read_remote_file(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
-    let content = ssh_exec(&profile, &format!("cat {}", shell_escape_inner(&path)))?;
+    let content = {
+        let mut session_guard = get_session(&state, &profile)?;
+        let sftp = session_guard.sftp()
+            .map_err(|e| format!("Failed to open SFTP subsystem: {}", e))?;
+        let mut file = sftp.open(std::path::Path::new(&path))
+            .map_err(|e| format!("SFTP open failed: {}", e))?;
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut file, &mut buf)
+            .map_err(|e| format!("SFTP read failed: {}", e))?;
+        buf
+    };
+    // trying to replace with SFTP tools
+    //let content = ssh_exec(&state, &profile, &format!("cat {}", shell_escape_inner(&path)))?;
     state.cache.put_file(cache_key, content.clone());
     Ok(content)
 }
@@ -1024,7 +1229,7 @@ pub async fn read_remote_file_base64(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
-    let output = ssh_exec(&profile, &format!("base64 {}", shell_escape_inner(&path)))?;
+    let output = ssh_exec(&state, &profile, &format!("base64 {}", shell_escape_inner(&path)))?;
     Ok(output.chars().filter(|c| !c.is_whitespace()).collect())
 }
 
@@ -1045,7 +1250,7 @@ pub async fn create_remote_directory(
     };
 
     let cmd = format!("mkdir -p {}", shell_escape_inner(&path));
-    ssh_exec(&profile, &cmd)?;
+    ssh_exec(&state, &profile, &cmd)?;
     state.cache.invalidate_path(&profile_id, &path);
     Ok(())
 }
@@ -1066,26 +1271,45 @@ pub async fn delete_remote_file(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
+    let mut session_guard = get_session(&state, &profile)?;
+    let sftp = session_guard.sftp()
+        .map_err(|e| format!("Failed to open SFTP subsystem: {}", e))?;
+
+    let stat = sftp.stat(std::path::Path::new(&path))
+        .map_err(|_| "Path does not exist".to_string())?;
+
+    if stat.is_dir() {
+        // SFTP rmdir only removes empty dirs; fall back to ssh_exec for recursive delete
+        drop(sftp);
+        drop(session_guard);
+        ssh_exec(&state, &profile, &format!("rm -rf {}", shell_escape_inner(&path)))?;
+    } else {
+        sftp.unlink(std::path::Path::new(&path))
+            .map_err(|e| format!("SFTP delete failed: {}", e))?;
+    }
+    // trying to replace with SFTP tools
+    /*
     // Check if path is a file or directory
     let escaped = shell_escape_inner(&path);
     let check_cmd = format!(
         "if [ -d {} ]; then echo DIR; elif [ -f {} ]; then echo FILE; else echo NONE; fi",
         escaped, escaped
     );
-    let result = ssh_exec(&profile, &check_cmd)?;
+    let result = ssh_exec(&state, &profile, &check_cmd)?;
     let kind = result.trim();
 
     match kind {
         "FILE" => {
             let cmd = format!("rm {}", escaped);
-            ssh_exec(&profile, &cmd)?;
+            ssh_exec(&state, &profile, &cmd)?;
         }
         "DIR" => {
             let cmd = format!("rm -rf {}", escaped);
-            ssh_exec(&profile, &cmd)?;
+            ssh_exec(&state, &profile, &cmd)?;
         }
         _ => return Err("Path does not exist".to_string()),
     }
+    */
     Ok(())
 }
 
@@ -1106,12 +1330,26 @@ pub async fn rename_remote_path(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
+    // no longer used - consider deleting
+    /*
     let cmd = format!(
         "mv {} {}",
         shell_escape_inner(&old_path),
         shell_escape_inner(&new_path)
     );
-    ssh_exec(&profile, &cmd)?;
+    */
+
+    let mut session_guard = get_session(&state, &profile)?;
+    let sftp = session_guard.sftp()
+        .map_err(|e| format!("Failed to open SFTP subsystem: {}", e))?;
+    sftp.rename(
+        std::path::Path::new(&old_path),
+        std::path::Path::new(&new_path),
+        None,
+    ).map_err(|e| format!("SFTP rename failed: {}", e))?;
+
+    // trying to replace with SFTP tools
+    //ssh_exec(&state, &profile, &cmd)?;
     Ok(())
 }
 
@@ -1135,10 +1373,26 @@ pub async fn write_remote_file(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
+    let mut session_guard = get_session(&state, &profile)?;
+    let sftp = session_guard.sftp()
+        .map_err(|e| format!("Failed to open SFTP subsystem: {}", e))?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = sftp.mkdir(parent, 0o755); // ignore error if already exists
+    }
+
+    let mut file = sftp.create(std::path::Path::new(&path))
+        .map_err(|e| format!("SFTP create failed: {}", e))?;
+    std::io::Write::write_all(&mut file, content.as_bytes())
+        .map_err(|e| format!("SFTP write failed: {}", e))?;
+
+    // I'm trying to replace this with SFTP tools
+    /*
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let mkdir_cmd = format!("mkdir -p {}", shell_escape_inner(&parent.to_string_lossy()));
-        let _ = ssh_exec(&profile, &mkdir_cmd);
+        let _ = ssh_exec(&state, &profile, &mkdir_cmd);
     }
 
     let escaped_path = shell_escape_inner(&path);
@@ -1155,13 +1409,13 @@ pub async fn write_remote_file(
     if b64.len() <= CHUNK_SIZE {
         // Small file — single command, no temp file needed
         let cmd = format!("printf %s {} | base64 -d > {}", b64, escaped_path);
-        ssh_exec(&profile, &cmd)?;
+        ssh_exec(&state, &profile, &cmd)?;
     } else {
         // Large file — write base64 in chunks, then decode
         // First chunk: truncate (>)
         let first_chunk = &b64[..CHUNK_SIZE];
         let cmd = format!("printf %s {} > {}", first_chunk, tmp_b64);
-        ssh_exec(&profile, &cmd)?;
+        ssh_exec(&state, &profile, &cmd)?;
 
         // Remaining chunks: append (>>)
         let mut offset = CHUNK_SIZE;
@@ -1169,7 +1423,7 @@ pub async fn write_remote_file(
             let end = std::cmp::min(offset + CHUNK_SIZE, b64.len());
             let chunk = &b64[offset..end];
             let cmd = format!("printf %s {} >> {}", chunk, tmp_b64);
-            ssh_exec(&profile, &cmd)?;
+            ssh_exec(&state, &profile, &cmd)?;
             offset = end;
         }
 
@@ -1178,9 +1432,9 @@ pub async fn write_remote_file(
             "base64 -d {} > {} && rm -f {}",
             tmp_b64, escaped_path, tmp_b64
         );
-        ssh_exec(&profile, &cmd)?;
+        ssh_exec(&state, &profile, &cmd)?;
     }
-
+    */
     state.cache.invalidate_path(&profile_id, &path);
     Ok(())
 }
@@ -1206,7 +1460,7 @@ pub async fn scp_to_remote(
     // Ensure remote parent directory exists
     if let Some(parent) = std::path::Path::new(&remote_path).parent() {
         let mkdir_cmd = format!("mkdir -p {}", shell_escape_inner(&parent.to_string_lossy()));
-        let _ = ssh_exec(&profile, &mkdir_cmd);
+        let _ = ssh_exec(&state, &profile, &mkdir_cmd);
     }
 
     let host_str = format!("{}@{}", profile.user, profile.host);
@@ -1413,7 +1667,7 @@ pub async fn scp_batch_upload(
 
     // Ensure remote directory exists
     let mkdir_cmd = format!("mkdir -p {}", shell_escape_inner(&remote_dir));
-    let _ = ssh_exec(&profile, &mkdir_cmd);
+    let _ = ssh_exec(&state, &profile, &mkdir_cmd);
 
     let total = local_paths.len() as u32;
     let mut completed: u32 = 0;
@@ -1585,6 +1839,9 @@ pub async fn setup_ssh_key(
     let public_key_path = ssh_dir.join(format!("{}.pub", key_name));
 
     if !private_key_path.exists() {
+        // I hate that I have to do this, but libssh2 isn't playing well with the ed25519 format
+        // I'm trying to replace it with RSA instead
+        /*
         let output = hide_window(std::process::Command::new("ssh-keygen").args([
             "-t",
             "ed25519",
@@ -1595,9 +1852,18 @@ pub async fn setup_ssh_key(
             "-C",
             &format!("operon@{}", profile.host),
         ]))
+        */
+        let output = hide_window(std::process::Command::new("ssh-keygen").args([
+            "-t", "rsa",
+            "-b", "4096",
+            "-m", "PEM",    // traditional PEM format, not OpenSSH format
+            "-f", &private_key_path.to_string_lossy(),
+            "-N", "",
+            "-C", &format!("operon@{}", profile.host),
+        ]))
         .output()
         .map_err(|e| format!("Failed to run ssh-keygen: {}", e))?;
-
+        
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("ssh-keygen failed: {}", stderr));
@@ -1640,6 +1906,10 @@ pub async fn setup_ssh_key(
         pub_key, pub_key
     );
 
+    // I think this is just not used on windows...
+    // it was giving a warning when compiling so I'm going to
+    // try to only initialize it on non-windows platforms for now
+    #[cfg(not(target_os = "windows"))]
     let ssh_cmd = format!(
         "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p {} {}@{} {}",
         profile.port,
@@ -2024,7 +2294,16 @@ pub async fn setup_ssh_key(
             "Key installed, but server still requires MFA. ControlMaster will keep sessions alive.",
         );
 
-        let key_path_str = private_key_path.to_string_lossy().to_string();
+        // necessary because Windows saves paths with "\\"
+        // and if ssh is routed through bash, they get stripped
+        let key_path_str = {
+            let raw = private_key_path.to_string_lossy().to_string();
+            #[cfg(target_os = "windows")]
+            { raw.replace('\\', "/") }
+            #[cfg(not(target_os = "windows"))]
+            { raw }
+        };
+
         {
             let mut profiles_lock = state.profiles.lock().map_err(|e| e.to_string())?;
             if let Some(p) = profiles_lock.iter_mut().find(|p| p.id == profile_id) {
@@ -2044,7 +2323,16 @@ pub async fn setup_ssh_key(
         "SSH key installed and verified! No more passwords or MFA needed.",
     );
 
-    let key_path_str = private_key_path.to_string_lossy().to_string();
+    // necessary because Windows saves paths with "\\"
+    // and if ssh is routed through bash, they get stripped
+    let key_path_str = {
+        let raw = private_key_path.to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        { raw.replace('\\', "/") }
+        #[cfg(not(target_os = "windows"))]
+        { raw }
+    };
+
     {
         let mut profiles_lock = state.profiles.lock().map_err(|e| e.to_string())?;
         if let Some(p) = profiles_lock.iter_mut().find(|p| p.id == profile_id) {
@@ -2074,7 +2362,7 @@ pub async fn test_ssh_connection(
             .ok_or_else(|| format!("SSH profile {} not found", profile_id))?
     };
 
-    let result = ssh_exec(&profile, "echo ok && hostname")?;
+    let result = ssh_exec(&state, &profile, "echo ok && hostname")?;
     Ok(result.trim().to_string())
 }
 
@@ -2208,7 +2496,7 @@ done
 echo "work_dir=$HOME"
 "#;
 
-    let output = ssh_exec(&profile, detect_script)?;
+    let output = ssh_exec(&state, &profile, detect_script)?;
 
     let mut config = HashMap::new();
     for line in output.lines() {

@@ -15,6 +15,7 @@ build-universal.sh
 
 # IDE / Editor
 .vscode/
+.vs/
 .idea/
 *.swp
 *.swo

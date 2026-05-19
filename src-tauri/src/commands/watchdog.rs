@@ -167,7 +167,7 @@ pub async fn detect_scheduler(
         .find(|p| p.id == profile_id)
         .cloned()
         .ok_or_else(|| format!("SSH profile {} not found", profile_id))?;
-    let out = ssh_exec(&profile, Scheduler::detect_script())?;
+    let out = ssh_exec(&ssh_state, &profile, Scheduler::detect_script())?;
     Ok(out.trim().to_string())
 }
 
@@ -193,13 +193,13 @@ pub async fn install_watchdog(
 
     // mkdir, decode, chmod +x
     let mkdir_cmd = format!("mkdir -p {}/jobs && chmod 700 {}", REMOTE_DIR, REMOTE_DIR);
-    ssh_exec(&profile, &mkdir_cmd).map_err(|e| format!("mkdir failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &mkdir_cmd).map_err(|e| format!("mkdir failed: {}", e))?;
 
     let write_cmd = format!(
         "printf %s {} | base64 -d > {} && chmod +x {}",
         b64, REMOTE_SCRIPT, REMOTE_SCRIPT
     );
-    ssh_exec(&profile, &write_cmd).map_err(|e| format!("upload failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &write_cmd).map_err(|e| format!("upload failed: {}", e))?;
 
     // Seed a default policy if none exists.
     let default_policy = serde_json::to_string(&JobPolicy::default())
@@ -209,7 +209,7 @@ pub async fn install_watchdog(
         dir = REMOTE_DIR,
         json = shell_quote(&default_policy),
     );
-    ssh_exec(&profile, &policy_cmd).map_err(|e| format!("policy seed failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &policy_cmd).map_err(|e| format!("policy seed failed: {}", e))?;
 
     Ok(())
 }
@@ -247,7 +247,7 @@ pub async fn start_watchdog(
         session = TMUX_SESSION,
         script = REMOTE_SCRIPT,
     );
-    ssh_exec(&profile, &cmd).map_err(|e| format!("start failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| format!("start failed: {}", e))?;
     Ok(())
 }
 
@@ -273,7 +273,7 @@ pub async fn stop_watchdog(
          fi; echo ok",
         session = TMUX_SESSION,
     );
-    ssh_exec(&profile, &cmd).map_err(|e| format!("stop failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| format!("stop failed: {}", e))?;
     Ok(())
 }
 
@@ -302,7 +302,7 @@ else echo scheduler=
 fi
 if [ -f $HOME/.operon/watchlist ]; then wc -l < $HOME/.operon/watchlist; else echo 0; fi
 "#;
-    let out = ssh_exec(&profile, script)?;
+    let out = ssh_exec(&ssh_state, &profile, script)?;
     let mut installed = false;
     let mut running = false;
     let mut scheduler: Option<String> = None;
@@ -379,7 +379,7 @@ pub async fn register_watched_job(
         jid = job_id,
         line = shell_quote(&line),
     );
-    ssh_exec(&profile, &cmd).map_err(|e| format!("register failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| format!("register failed: {}", e))?;
     Ok(())
 }
 
@@ -404,7 +404,7 @@ pub async fn unregister_watched_job(
         dir = REMOTE_DIR,
         jid = job_id,
     );
-    ssh_exec(&profile, &cmd).map_err(|e| format!("unregister failed: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| format!("unregister failed: {}", e))?;
     Ok(())
 }
 
@@ -421,7 +421,7 @@ pub async fn list_watched_jobs(
         .find(|p| p.id == profile_id)
         .cloned()
         .ok_or_else(|| format!("SSH profile {} not found", profile_id))?;
-    let out = ssh_exec(&profile, "cat $HOME/.operon/watchlist 2>/dev/null").unwrap_or_default();
+    let out = ssh_exec(&ssh_state, &profile, "cat $HOME/.operon/watchlist 2>/dev/null").unwrap_or_default();
     let mut jobs = Vec::new();
     for line in out.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -457,7 +457,7 @@ pub async fn get_job_policy(
         .find(|p| p.id == profile_id)
         .cloned()
         .ok_or_else(|| format!("SSH profile {} not found", profile_id))?;
-    let out = ssh_exec(&profile, "cat $HOME/.operon/policy.json 2>/dev/null").unwrap_or_default();
+    let out = ssh_exec(&ssh_state, &profile, "cat $HOME/.operon/policy.json 2>/dev/null").unwrap_or_default();
     if out.trim().is_empty() {
         return Ok(JobPolicy::default());
     }
@@ -484,7 +484,7 @@ pub async fn set_job_policy(
         dir = REMOTE_DIR,
         json = shell_quote(&json),
     );
-    ssh_exec(&profile, &cmd).map_err(|e| format!("policy write: {}", e))?;
+    ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| format!("policy write: {}", e))?;
     Ok(())
 }
 
@@ -509,7 +509,7 @@ pub async fn read_job_events(
         "cat $HOME/.operon/jobs/{}.jsonl 2>/dev/null",
         shell_quote(&job_id)
     );
-    ssh_exec(&profile, &cmd)
+    ssh_exec(&ssh_state, &profile, &cmd)
 }
 
 /// Start tailing a job's event log and emit each NDJSON line as
@@ -575,7 +575,7 @@ pub async fn start_job_tail(
     cmd.stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
+        use std::os::windows::process::CommandExt; // currently unused?
         cmd.creation_flags(0x08000000);
     }
 

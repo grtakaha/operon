@@ -561,7 +561,7 @@ pub async fn check_remote_mcp_dependencies(
         _ => return Err(format!("Unknown runtime: {}", runtime)),
     };
 
-    let output = super::ssh::ssh_exec(&profile, check_cmd)
+    let output = super::ssh::ssh_exec(&ssh_state, &profile, check_cmd)
         .map_err(|e| format!("SSH check failed: {}", e))?;
 
     let version_str = output.trim().to_string();
@@ -618,7 +618,7 @@ pub async fn install_remote_mcp_server(
         _ => return Err(format!("Unknown runtime: {}", entry.runtime)),
     };
 
-    super::ssh::ssh_exec(&profile, &install_cmd)
+    super::ssh::ssh_exec(&ssh_state, &profile, &install_cmd)
         .map_err(|e| format!("Remote install failed: {}", e))?;
 
     Ok(())

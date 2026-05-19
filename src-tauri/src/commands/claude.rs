@@ -952,7 +952,7 @@ echo "CLAUDE:$CLAUDE_VER"
 echo "REPORTLAB:$(python3 -c 'import reportlab; print(reportlab.Version)' 2>/dev/null || echo MISSING)"
 "#;
 
-    let result = super::ssh::ssh_exec(&profile, check_script)
+    let result = super::ssh::ssh_exec(&ssh_state, &profile, check_script)
         .map_err(|e| format!("SSH check failed: {}", e))?;
 
     let node_line = result
@@ -1089,7 +1089,7 @@ fi
 echo "AUTH:ok"
 "#;
 
-    let result = super::ssh::ssh_exec(&profile, check_script)
+    let result = super::ssh::ssh_exec(&ssh_state, &profile, check_script)
         .map_err(|e| format!("SSH auth check failed: {}", e))?;
 
     eprintln!("[Operon] Remote auth check result: {}", result.trim());
@@ -1186,7 +1186,7 @@ fi
 echo OPERON_INSTALL_FAILED
 ";
 
-    let result = super::ssh::ssh_exec(&profile, install_script)
+    let result = super::ssh::ssh_exec(&ssh_state, &profile, install_script)
         .map_err(|e| format!("Remote install failed: {}", e))?;
 
     if result.contains("OPERON_INSTALL_SUCCESS") {
@@ -1200,7 +1200,7 @@ done
 WHICH=$(command -v claude 2>/dev/null)
 [ -n "$WHICH" ] && echo "CLAUDE_PATH:$WHICH" || echo "CLAUDE_PATH:claude"
 "#;
-        if let Ok(probe_result) = super::ssh::ssh_exec(&profile, probe_script) {
+        if let Ok(probe_result) = super::ssh::ssh_exec(&ssh_state, &profile, probe_script) {
             if let Some(path_line) = probe_result.lines().find(|l| l.starts_with("CLAUDE_PATH:")) {
                 let claude_path = path_line
                     .strip_prefix("CLAUDE_PATH:")
@@ -1230,7 +1230,7 @@ for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc";
     printf '\n%s\n%s\n' "$MARKER" "$LINE" >> "$rc"
 done
 "#;
-        let _ = super::ssh::ssh_exec(&profile, patch_rc_script);
+        let _ = super::ssh::ssh_exec(&ssh_state, &profile, patch_rc_script);
 
         // Also install reportlab for PDF report generation on the remote server
         let reportlab_script = r#"
@@ -1250,7 +1250,7 @@ else
 fi
 "#;
         // Best-effort: don't fail the whole install if reportlab can't be installed
-        if let Ok(rl_result) = super::ssh::ssh_exec(&profile, reportlab_script) {
+        if let Ok(rl_result) = super::ssh::ssh_exec(&ssh_state, &profile, reportlab_script) {
             if rl_result.contains("REPORTLAB_SKIP") {
                 eprintln!("[operon] reportlab could not be installed on remote server — report mode will attempt at runtime");
             }
@@ -1357,7 +1357,7 @@ fi
         claude_bin = claude_bin,
     );
 
-    let result = super::ssh::ssh_exec(&profile, &login_script)
+    let result = super::ssh::ssh_exec(&ssh_state, &profile, &login_script)
         .map_err(|e| format!("Failed to run claude login: {}", e))?;
 
     eprintln!("[operon] remote_claude_login output: {}", result);
@@ -1755,7 +1755,7 @@ pub async fn start_claude_session(
                 "cat '{}'/implementation_plan.md 2>/dev/null || echo ''",
                 ctx.remote_path.replace('\'', "'\\''")
             );
-            super::ssh::ssh_exec(&prof, &check_cmd).unwrap_or_default()
+            super::ssh::ssh_exec(&ssh_state, &prof, &check_cmd).unwrap_or_default()
         } else {
             String::new()
         }
@@ -1910,7 +1910,7 @@ pub async fn start_claude_session(
                     base = ctx.remote_path.replace('\'', "'\\''"),
                     ts = now_filename
                 );
-                let _ = super::ssh::ssh_exec(&prof, &archive_cmd);
+                let _ = super::ssh::ssh_exec(&ssh_state, &prof, &archive_cmd);
             }
         } else {
             // Local: archive to .operon/plan_history/
@@ -2192,7 +2192,7 @@ pub async fn start_claude_session(
                     encoded_json,
                     mcp_config_remote.replace('\'', "'\\''")
                 );
-                let _ = super::ssh::ssh_exec(&profile, &write_cmd);
+                let _ = super::ssh::ssh_exec(&ssh_state, &profile, &write_cmd);
                 // Replace the local config path in claude_cmd with the remote path
                 if let Some(local_path) = super::mcp::generate_mcp_config(&mcp_servers)? {
                     claude_cmd = claude_cmd.replace(
@@ -2345,7 +2345,7 @@ pub async fn start_claude_session(
                         b64_script, escaped_script,
                     );
                     let t0 = std::time::Instant::now();
-                    crate::commands::ssh::ssh_exec(&profile, &write_cmd).map_err(|e| {
+                    super::ssh::ssh_exec(&ssh_state, &profile, &write_cmd).map_err(|e| {
                         eprintln!("[operon] script upload FAILED (single-shot): {}", e);
                         format!("Failed to create run script on remote: {}", e)
                     })?;
@@ -2364,7 +2364,7 @@ pub async fn start_claude_session(
                         let chunk = &b64_script[offset..end];
                         let redirect = if first { ">" } else { ">>" };
                         let cmd = format!("printf %s {} {} \"{}\"", chunk, redirect, tmp_b64,);
-                        crate::commands::ssh::ssh_exec(&profile, &cmd).map_err(|e| {
+                        super::ssh::ssh_exec(&ssh_state, &profile, &cmd).map_err(|e| {
                             eprintln!("[operon] script upload chunk {} FAILED: {}", chunk_idx, e);
                             format!("Failed to upload script chunk to remote: {}", e)
                         })?;
@@ -2382,7 +2382,7 @@ pub async fn start_claude_session(
                         "base64 -d \"{}\" > \"{}\" && rm -f \"{}\"",
                         tmp_b64, escaped_script, tmp_b64,
                     );
-                    crate::commands::ssh::ssh_exec(&profile, &decode_cmd).map_err(|e| {
+                    super::ssh::ssh_exec(&ssh_state, &profile, &decode_cmd).map_err(|e| {
                         eprintln!("[operon] script decode FAILED: {}", e);
                         format!("Failed to decode run script on remote: {}", e)
                     })?;
@@ -2449,6 +2449,9 @@ pub async fn start_claude_session(
                     ctrl_sock.to_string_lossy()
                 ));
             }
+            // I'm trying to make a more robust fix from the beginning
+            // but know that for Windows, this key starts with backslashes
+            // and I'm changing them to forward slashes in setup_ssh_key()
             if let Some(key) = &profile.key_file {
                 ssh_tail_args.push_str(&format!(" -i {}", key));
             }
@@ -2681,7 +2684,7 @@ pub async fn start_claude_session(
 
             echo ""
         "#;
-        let claude_resolve = super::ssh::ssh_exec(&profile, find_claude_cmd).unwrap_or_default();
+        let claude_resolve = super::ssh::ssh_exec(&ssh_state, &profile, find_claude_cmd).unwrap_or_default();
         let claude_resolve = claude_resolve.trim().to_string();
 
         if claude_resolve.is_empty() || claude_resolve.contains("not found") {
@@ -3001,7 +3004,7 @@ pub async fn check_existing_plan(
             "cat '{}'/implementation_plan.md 2>/dev/null || echo ''",
             ctx.remote_path.replace('\'', "'\\''")
         );
-        let content = super::ssh::ssh_exec(&profile, &check_cmd).unwrap_or_default();
+        let content = super::ssh::ssh_exec(&ssh_state, &profile, &check_cmd).unwrap_or_default();
         Ok(content.trim().to_string())
     } else {
         // Local
@@ -3093,7 +3096,7 @@ pub async fn archive_current_plan(
                      echo 'ARCHIVED'; \
                  else echo 'NO_PLAN'; fi"
             );
-            let result = super::ssh::ssh_exec(&prof, &cmd).unwrap_or_default();
+            let result = super::ssh::ssh_exec(&ssh_state, &prof, &cmd).unwrap_or_default();
             return Ok(result.contains("ARCHIVED"));
         }
         Ok(false)
@@ -3289,7 +3292,7 @@ pub async fn check_session_files(
             output_file.replace('\'', "'\\''"),
             done_file.replace('\'', "'\\''"),
         );
-        let result = super::ssh::ssh_exec(&profile, &check_cmd).unwrap_or_default();
+        let result = super::ssh::ssh_exec(&ssh_state, &profile, &check_cmd).unwrap_or_default();
         let output_exists = result.contains("output:yes");
         let done_exists = result.contains("done:yes");
         Ok(SessionFileStatus {
@@ -3337,7 +3340,7 @@ pub async fn read_session_output(
                 .ok_or_else(|| format!("SSH profile {} not found", ctx.profile_id))?
         };
         let cat_cmd = format!("cat '{}'", output_file.replace('\'', "'\\''"));
-        let content = super::ssh::ssh_exec(&profile, &cat_cmd)
+        let content = super::ssh::ssh_exec(&ssh_state, &profile, &cat_cmd)
             .map_err(|e| format!("Failed to read session output: {}", e))?;
         Ok(content)
     } else {
@@ -3381,6 +3384,9 @@ pub async fn reconnect_session(
             "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes {}@{} -p {}",
             profile.user, profile.host, profile.port
         );
+        // I'm trying to make a more robust fix from the beginning
+        // but know that for Windows, this key starts with backslashes
+        // and I'm changing them to forward slashes in setup_ssh_key()
         if let Some(key) = &profile.key_file {
             ssh_tail_args.push_str(&format!(" -i {}", key));
         }
@@ -3513,6 +3519,9 @@ pub async fn reconnect_tail(
             ctrl_sock.to_string_lossy()
         ));
     }
+    // I'm trying to make a more robust fix from the beginning
+    // but know that for Windows, this key starts with backslashes
+    // and I'm changing them to forward slashes in setup_ssh_key()
     if let Some(key) = &profile.key_file {
         ssh_tail_args.push_str(&format!(" -i {}", key));
     }
@@ -3627,7 +3636,7 @@ pub async fn delete_session(
                         output_file.replace('\'', "'\\''"),
                         done_file.replace('\'', "'\\''"),
                     );
-                    let _ = super::ssh::ssh_exec(&profile, &rm_cmd);
+                    let _ = super::ssh::ssh_exec(&ssh_state, &profile, &rm_cmd);
                 }
             } else {
                 let _ = std::fs::remove_file(&output_file);
@@ -3700,7 +3709,7 @@ echo '__SLURM__'
 squeue -u "$(id -un 2>/dev/null || echo "$USER")" -h -o '%i %j %T %D %m %R' 2>/dev/null || true
 echo '__END__'
 "#;
-    let out = super::ssh::ssh_exec(&profile, script).unwrap_or_default();
+    let out = super::ssh::ssh_exec(&ssh_state, &profile, script).unwrap_or_default();
 
     let mut section = "";
     let mut helpers = Vec::new();
@@ -3840,7 +3849,7 @@ pub async fn teardown_remote_footprint(
     }
     script.push_str("true\n");
 
-    let _ = super::ssh::ssh_exec(&profile, &script);
+    let _ = super::ssh::ssh_exec(&ssh_state, &profile, &script);
 
     let mut msg = format!(
         "Stopped {} Operon SSH process(es); cleaned up remote log-streamers and scratch files",

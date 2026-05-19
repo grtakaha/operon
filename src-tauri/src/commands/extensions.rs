@@ -2065,7 +2065,7 @@ pub async fn install_remote_extension(
 
     // Create remote directory and copy
     let mkdir_cmd = format!("mkdir -p {}", remote_ext_dir);
-    super::ssh::ssh_exec(&profile, &mkdir_cmd)
+    super::ssh::ssh_exec(&ssh_state, &profile, &mkdir_cmd)
         .map_err(|e| format!("Failed to create remote dir: {}", e))?;
 
     // SCP the VSIX file
@@ -2093,7 +2093,7 @@ pub async fn install_remote_extension(
         "cd {} && unzip -o {}.vsix -d . 2>/dev/null || python3 -c \"import zipfile; zipfile.ZipFile('{}.vsix').extractall('.')\" 2>/dev/null; rm -f {}.vsix",
         remote_ext_dir, ext_id, ext_id, ext_id
     );
-    super::ssh::ssh_exec(&profile, &extract_cmd)
+    super::ssh::ssh_exec(&ssh_state, &profile, &extract_cmd)
         .map_err(|e| format!("Remote extraction failed: {}", e))?;
 
     // Clean up local temp

@@ -212,7 +212,9 @@ pub fn find_git_bash() -> Option<String> {
     let candidates = [
         // Standard system-wide install
         r"C:\Program Files\Git\bin\bash.exe".to_string(),
+        r"C:\Program Files\Git\usr\bin\bash.exe".to_string(),
         r"C:\Program Files (x86)\Git\bin\bash.exe".to_string(),
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe".to_string(),
         // User-level / winget install locations
         format!(r"{}\Programs\Git\bin\bash.exe", localappdata.display()),
         format!(r"{}\Git\bin\bash.exe", localappdata.display()),
@@ -243,6 +245,38 @@ pub fn find_git_bash() -> Option<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
+
+    // Windows was having trouble if the WSL was installed
+    // It would return an unusable bash path like C:\Windows\System32\bash.exe
+    if where_out.status.success() {
+        let output = String::from_utf8_lossy(&where_out.stdout);
+        let is_windows_path = |p: &str| {
+            p.len() >= 2 
+                && p.chars().nth(1) == Some(':')
+                && !p.to_lowercase().contains("windowsapps")  // exclude WSL
+        };
+        // Prefer Git-specific paths
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty()
+                && is_windows_path(trimmed)
+                && trimmed.to_lowercase().contains("git")
+            {
+                return Some(trimmed.to_string());
+            }
+        }
+        // Fall back to first Windows-style path
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && is_windows_path(trimmed) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // this could cause problems if command is run in something like git bash
+    // which could return a non-Windows path (for internal use only)
+    // replacing with the code above.
+    /*
     if where_out.status.success() {
         // where.exe may return multiple results; prefer one inside a Git directory
         for line in String::from_utf8_lossy(&where_out.stdout).lines() {
@@ -261,7 +295,7 @@ pub fn find_git_bash() -> Option<String> {
             return Some(first);
         }
     }
-
+    */
     None
 }
 

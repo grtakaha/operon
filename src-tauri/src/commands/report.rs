@@ -1019,7 +1019,7 @@ pub async fn scan_remote_project_files(
         &find_cmd[..find_cmd.len().min(300)]
     );
     let output =
-        super::ssh::ssh_exec(&profile, &find_cmd).map_err(|e| format!("SSH scan failed: {}", e))?;
+        super::ssh::ssh_exec(&ssh_state, &profile, &find_cmd).map_err(|e| format!("SSH scan failed: {}", e))?;
     eprintln!(
         "[operon] Remote scan output: {} bytes, {} lines",
         output.len(),
@@ -1046,7 +1046,7 @@ pub async fn scan_remote_project_files(
             p = escaped_path,
             d = MAX_SCAN_DEPTH
         );
-        let fallback_output = super::ssh::ssh_exec(&profile, &fallback_cmd)
+        let fallback_output = super::ssh::ssh_exec(&ssh_state, &profile, &fallback_cmd)
             .map_err(|e| format!("SSH scan fallback failed: {}", e))?;
         eprintln!(
             "[operon] Fallback scan output: {} bytes, {} lines",
@@ -1367,7 +1367,7 @@ pub async fn batch_read_remote_file_previews(
             "head -n {} '{}' 2>/dev/null | head -c {}",
             MAX_PREVIEW_LINES, escaped, MAX_PREVIEW_BYTES
         );
-        match super::ssh::ssh_exec(&profile, &cmd) {
+        match super::ssh::ssh_exec(&ssh_state, &profile, &cmd) {
             Ok(output) => {
                 let truncated = output.lines().count() >= MAX_PREVIEW_LINES
                     || output.len() >= MAX_PREVIEW_BYTES;

@@ -309,7 +309,7 @@ pub async fn index_remote_project(
         remote_path.replace('\'', "'\\''")
     );
 
-    let output = crate::commands::ssh::ssh_exec(&profile, &find_cmd)?;
+    let output = crate::commands::ssh::ssh_exec(&ssh_state, &profile, &find_cmd)?;
     let mut entries = Vec::new();
 
     for line in output.lines() {
@@ -1657,7 +1657,7 @@ pub async fn check_remote_ripgrep(
             rg --version 2>/dev/null | head -n1 || true; \
         fi; \
         if command -v grep >/dev/null 2>&1; then echo HAS_GREP=1; fi";
-    let output = crate::commands::ssh::ssh_exec(&profile, script)?;
+    let output = crate::commands::ssh::ssh_exec(&ssh_state, &profile, script)?;
 
     let mut rg_path = None;
     let mut version = None;
@@ -1729,6 +1729,7 @@ pub async fn install_remote_ripgrep(
 
     // 1) Prepare remote dir
     crate::commands::ssh::ssh_exec(
+        &ssh_state,
         &profile,
         "mkdir -p $HOME/.operon/bin && rm -f /tmp/operon-rg-upload",
     )?;
@@ -1779,7 +1780,7 @@ pub async fn install_remote_ripgrep(
          $HOME/.operon/bin/rg --version 2>/dev/null | head -n1",
         tmp = remote_tmp,
     );
-    let version_out = crate::commands::ssh::ssh_exec(&profile, &install_cmd)?;
+    let version_out = crate::commands::ssh::ssh_exec(&ssh_state, &profile, &install_cmd)?;
     if !version_out.contains("ripgrep") {
         return Err(format!(
             "Install failed — binary does not run on this server. Output: {}",
@@ -1836,7 +1837,7 @@ pub async fn search_in_remote_directory(
         if [ -x \"$HOME/.operon/bin/rg\" ]; then echo $HOME/.operon/bin/rg; \
         elif command -v rg >/dev/null 2>&1; then echo rg; \
         else echo __no_rg__; fi";
-    let rg_probe = crate::commands::ssh::ssh_exec(&profile, probe)?
+    let rg_probe = crate::commands::ssh::ssh_exec(&ssh_state, &profile, probe)?
         .trim()
         .to_string();
     let has_rg = rg_probe != "__no_rg__" && !rg_probe.is_empty();
@@ -1883,7 +1884,7 @@ pub async fn search_in_remote_directory(
             script.as_bytes(),
         );
         let wrapped = format!("echo '{}' | base64 -d | bash", script_b64);
-        let stdout = crate::commands::ssh::ssh_exec(&profile, &wrapped)?;
+        let stdout = crate::commands::ssh::ssh_exec(&ssh_state, &profile, &wrapped)?;
         let hits = parse_rg_json(stdout.as_bytes(), &root_path, max_results);
         return Ok(SearchResult {
             hits,
@@ -1915,7 +1916,7 @@ grep -rnHI {case}{regex}{exc} -- \"$Q\" . 2>/dev/null | head -n {n}",
         remote_script.as_bytes(),
     );
     let wrapped = format!("echo '{}' | base64 -d | bash", script_b64);
-    let output = crate::commands::ssh::ssh_exec(&profile, &wrapped)?;
+    let output = crate::commands::ssh::ssh_exec(&ssh_state, &profile, &wrapped)?;
 
     let mut hits = Vec::new();
     for line in output.lines() {
@@ -2172,7 +2173,7 @@ find \"$R\" {depth} \\( {skip} -type f -print \\) 2>/dev/null \
         script.as_bytes(),
     );
     let wrapped = format!("echo '{}' | base64 -d | bash", script_b64);
-    let output = crate::commands::ssh::ssh_exec(&profile, &wrapped)?;
+    let output = crate::commands::ssh::ssh_exec(&ssh_state, &profile, &wrapped)?;
 
     let mut all: Vec<String> = output
         .lines()
